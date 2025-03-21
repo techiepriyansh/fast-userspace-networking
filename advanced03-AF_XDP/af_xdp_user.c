@@ -281,65 +281,52 @@ static bool process_packet(struct xsk_socket_info *xsk,
 {
 	uint8_t *pkt = xsk_umem__get_data(xsk->umem->buffer, addr);
 
-	/* Lesson#3: Write an IPv6 ICMP ECHO parser to send responses
-	 *
-	 * Some assumptions to make it easier:
-	 * - No VLAN handling
-	 * - Only if nexthdr is ICMP
-	 * - Just return all data with MAC/IP swapped, and type set to
-	 *   ICMPV6_ECHO_REPLY
-	 * - Recalculate the icmp checksum */
+	int ret;
+	uint32_t tx_idx = 0;
+	uint8_t tmp_mac[ETH_ALEN];
+	struct in6_addr tmp_ip;
+	struct ethhdr *eth = (struct ethhdr *) pkt;
+	struct ipv6hdr *ipv6 = (struct ipv6hdr *) (eth + 1);
+	struct icmp6hdr *icmp = (struct icmp6hdr *) (ipv6 + 1);
 
-	if (false) {
-		int ret;
-		uint32_t tx_idx = 0;
-		uint8_t tmp_mac[ETH_ALEN];
-		struct in6_addr tmp_ip;
-		struct ethhdr *eth = (struct ethhdr *) pkt;
-		struct ipv6hdr *ipv6 = (struct ipv6hdr *) (eth + 1);
-		struct icmp6hdr *icmp = (struct icmp6hdr *) (ipv6 + 1);
+	if (ntohs(eth->h_proto) != ETH_P_IPV6 ||
+		len < (sizeof(*eth) + sizeof(*ipv6) + sizeof(*icmp)) ||
+		ipv6->nexthdr != IPPROTO_ICMPV6 ||
+		icmp->icmp6_type != ICMPV6_ECHO_REQUEST)
+		return false;
 
-		if (ntohs(eth->h_proto) != ETH_P_IPV6 ||
-		    len < (sizeof(*eth) + sizeof(*ipv6) + sizeof(*icmp)) ||
-		    ipv6->nexthdr != IPPROTO_ICMPV6 ||
-		    icmp->icmp6_type != ICMPV6_ECHO_REQUEST)
-			return false;
+	memcpy(tmp_mac, eth->h_dest, ETH_ALEN);
+	memcpy(eth->h_dest, eth->h_source, ETH_ALEN);
+	memcpy(eth->h_source, tmp_mac, ETH_ALEN);
 
-		memcpy(tmp_mac, eth->h_dest, ETH_ALEN);
-		memcpy(eth->h_dest, eth->h_source, ETH_ALEN);
-		memcpy(eth->h_source, tmp_mac, ETH_ALEN);
+	memcpy(&tmp_ip, &ipv6->saddr, sizeof(tmp_ip));
+	memcpy(&ipv6->saddr, &ipv6->daddr, sizeof(tmp_ip));
+	memcpy(&ipv6->daddr, &tmp_ip, sizeof(tmp_ip));
 
-		memcpy(&tmp_ip, &ipv6->saddr, sizeof(tmp_ip));
-		memcpy(&ipv6->saddr, &ipv6->daddr, sizeof(tmp_ip));
-		memcpy(&ipv6->daddr, &tmp_ip, sizeof(tmp_ip));
+	icmp->icmp6_type = ICMPV6_ECHO_REPLY;
 
-		icmp->icmp6_type = ICMPV6_ECHO_REPLY;
+	csum_replace2(&icmp->icmp6_cksum,
+				htons(ICMPV6_ECHO_REQUEST << 8),
+				htons(ICMPV6_ECHO_REPLY << 8));
 
-		csum_replace2(&icmp->icmp6_cksum,
-			      htons(ICMPV6_ECHO_REQUEST << 8),
-			      htons(ICMPV6_ECHO_REPLY << 8));
+	/* Here we sent the packet out of the receive port. Note that
+		* we allocate one entry and schedule it. Your design would be
+		* faster if you do batch processing/transmission */
 
-		/* Here we sent the packet out of the receive port. Note that
-		 * we allocate one entry and schedule it. Your design would be
-		 * faster if you do batch processing/transmission */
-
-		ret = xsk_ring_prod__reserve(&xsk->tx, 1, &tx_idx);
-		if (ret != 1) {
-			/* No more transmit slots, drop the packet */
-			return false;
-		}
-
-		xsk_ring_prod__tx_desc(&xsk->tx, tx_idx)->addr = addr;
-		xsk_ring_prod__tx_desc(&xsk->tx, tx_idx)->len = len;
-		xsk_ring_prod__submit(&xsk->tx, 1);
-		xsk->outstanding_tx++;
-
-		xsk->stats.tx_bytes += len;
-		xsk->stats.tx_packets++;
-		return true;
+	ret = xsk_ring_prod__reserve(&xsk->tx, 1, &tx_idx);
+	if (ret != 1) {
+		/* No more transmit slots, drop the packet */
+		return false;
 	}
 
-	return false;
+	xsk_ring_prod__tx_desc(&xsk->tx, tx_idx)->addr = addr;
+	xsk_ring_prod__tx_desc(&xsk->tx, tx_idx)->len = len;
+	xsk_ring_prod__submit(&xsk->tx, 1);
+	xsk->outstanding_tx++;
+
+	xsk->stats.tx_bytes += len;
+	xsk->stats.tx_packets++;
+	return true;
 }
 
 static void handle_receive_packets(struct xsk_socket_info *xsk)
@@ -411,91 +398,6 @@ static void rx_and_process(struct config *cfg,
 	}
 }
 
-#define NANOSEC_PER_SEC 1000000000 /* 10^9 */
-static uint64_t gettime(void)
-{
-	struct timespec t;
-	int res;
-
-	res = clock_gettime(CLOCK_MONOTONIC, &t);
-	if (res < 0) {
-		fprintf(stderr, "Error with gettimeofday! (%i)\n", res);
-		exit(EXIT_FAIL);
-	}
-	return (uint64_t) t.tv_sec * NANOSEC_PER_SEC + t.tv_nsec;
-}
-
-static double calc_period(struct stats_record *r, struct stats_record *p)
-{
-	double period_ = 0;
-	__u64 period = 0;
-
-	period = r->timestamp - p->timestamp;
-	if (period > 0)
-		period_ = ((double) period / NANOSEC_PER_SEC);
-
-	return period_;
-}
-
-static void stats_print(struct stats_record *stats_rec,
-			struct stats_record *stats_prev)
-{
-	uint64_t packets, bytes;
-	double period;
-	double pps; /* packets per sec */
-	double bps; /* bits per sec */
-
-	char *fmt = "%-12s %'11lld pkts (%'10.0f pps)"
-		" %'11lld Kbytes (%'6.0f Mbits/s)"
-		" period:%f\n";
-
-	period = calc_period(stats_rec, stats_prev);
-	if (period == 0)
-		period = 1;
-
-	packets = stats_rec->rx_packets - stats_prev->rx_packets;
-	pps     = packets / period;
-
-	bytes   = stats_rec->rx_bytes   - stats_prev->rx_bytes;
-	bps     = (bytes * 8) / period / 1000000;
-
-	printf(fmt, "AF_XDP RX:", stats_rec->rx_packets, pps,
-	       stats_rec->rx_bytes / 1000 , bps,
-	       period);
-
-	packets = stats_rec->tx_packets - stats_prev->tx_packets;
-	pps     = packets / period;
-
-	bytes   = stats_rec->tx_bytes   - stats_prev->tx_bytes;
-	bps     = (bytes * 8) / period / 1000000;
-
-	printf(fmt, "       TX:", stats_rec->tx_packets, pps,
-	       stats_rec->tx_bytes / 1000 , bps,
-	       period);
-
-	printf("\n");
-}
-
-static void *stats_poll(void *arg)
-{
-	unsigned int interval = 2;
-	struct xsk_socket_info *xsk = arg;
-	static struct stats_record previous_stats = { 0 };
-
-	previous_stats.timestamp = gettime();
-
-	/* Trick to pretty printf with thousands separators use %' */
-	setlocale(LC_NUMERIC, "en_US");
-
-	while (!global_exit) {
-		sleep(interval);
-		xsk->stats.timestamp = gettime();
-		stats_print(&xsk->stats, &previous_stats);
-		previous_stats = xsk->stats;
-	}
-	return NULL;
-}
-
 static void exit_application(int signal)
 {
 	int err;
@@ -513,7 +415,6 @@ static void exit_application(int signal)
 
 int main(int argc, char **argv)
 {
-	int ret;
 	void *packet_buffer;
 	uint64_t packet_buffer_size;
 	DECLARE_LIBBPF_OPTS(bpf_object_open_opts, opts);
@@ -521,7 +422,6 @@ int main(int argc, char **argv)
 	struct rlimit rlim = {RLIM_INFINITY, RLIM_INFINITY};
 	struct xsk_umem_info *umem;
 	struct xsk_socket_info *xsk_socket;
-	pthread_t stats_poll_thread;
 	int err;
 	char errmsg[1024];
 
@@ -623,17 +523,6 @@ int main(int argc, char **argv)
 		fprintf(stderr, "ERROR: Can't setup AF_XDP socket \"%s\"\n",
 			strerror(errno));
 		exit(EXIT_FAILURE);
-	}
-
-	/* Start thread to do statistics display */
-	if (verbose) {
-		ret = pthread_create(&stats_poll_thread, NULL, stats_poll,
-				     xsk_socket);
-		if (ret) {
-			fprintf(stderr, "ERROR: Failed creating statistics thread "
-				"\"%s\"\n", strerror(errno));
-			exit(EXIT_FAILURE);
-		}
 	}
 
 	/* Receive and count packets than drop them */
