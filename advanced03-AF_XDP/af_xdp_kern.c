@@ -18,10 +18,8 @@ int xdp_sock_prog(struct xdp_md *ctx)
 
 	/* A set entry here means that the correspnding queue_id
 	 * has an active AF_XDP socket bound to it. */
-	if (bpf_map_lookup_elem(&xsks_map, &index))
+	// if (bpf_map_lookup_elem(&xsks_map, &index)) // for now we have only one queue
 		return bpf_redirect_map(&xsks_map, index, 0);
-
-	return XDP_PASS;
 }
 
 char _license[] SEC("license") = "GPL";
