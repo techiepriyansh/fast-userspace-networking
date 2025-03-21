@@ -23,8 +23,8 @@
 #include <net/if.h>
 #include <linux/if_link.h>
 #include <linux/if_ether.h>
-#include <linux/ipv6.h>
-#include <linux/icmpv6.h>
+#include <linux/ip.h>
+#include <linux/icmp.h>
 
 #include "../common/common_params.h"
 #include "../common/common_user_bpf_xdp.h"
@@ -284,30 +284,35 @@ static bool process_packet(struct xsk_socket_info *xsk,
 	int ret;
 	uint32_t tx_idx = 0;
 	uint8_t tmp_mac[ETH_ALEN];
-	struct in6_addr tmp_ip;
+	uint32_t tmp_ip;
 	struct ethhdr *eth = (struct ethhdr *) pkt;
-	struct ipv6hdr *ipv6 = (struct ipv6hdr *) (eth + 1);
-	struct icmp6hdr *icmp = (struct icmp6hdr *) (ipv6 + 1);
+	struct iphdr *ipv4 = (struct iphdr *) (eth + 1);
+	struct icmphdr *icmp = (struct icmphdr *) (ipv4 + 1);
 
-	if (ntohs(eth->h_proto) != ETH_P_IPV6 ||
-		len < (sizeof(*eth) + sizeof(*ipv6) + sizeof(*icmp)) ||
-		ipv6->nexthdr != IPPROTO_ICMPV6 ||
-		icmp->icmp6_type != ICMPV6_ECHO_REQUEST)
+	if (ntohs(eth->h_proto) != ETH_P_IP ||
+		len < (sizeof(*eth) + sizeof(*ipv4) + sizeof(*icmp)) ||
+		ipv4->protocol != IPPROTO_ICMP ||
+		icmp->type != ICMP_ECHO)
 		return false;
 
+	// Swap MAC addresses
 	memcpy(tmp_mac, eth->h_dest, ETH_ALEN);
 	memcpy(eth->h_dest, eth->h_source, ETH_ALEN);
 	memcpy(eth->h_source, tmp_mac, ETH_ALEN);
 
-	memcpy(&tmp_ip, &ipv6->saddr, sizeof(tmp_ip));
-	memcpy(&ipv6->saddr, &ipv6->daddr, sizeof(tmp_ip));
-	memcpy(&ipv6->daddr, &tmp_ip, sizeof(tmp_ip));
+	// Swap IP addresses
+	tmp_ip = ipv4->saddr;
+	ipv4->saddr = ipv4->daddr;
+	ipv4->daddr = tmp_ip;
 
-	icmp->icmp6_type = ICMPV6_ECHO_REPLY;
+	// Set ICMP type to ECHO_REPLY
+	icmp->type = ICMP_ECHOREPLY;
 
-	csum_replace2(&icmp->icmp6_cksum,
-				htons(ICMPV6_ECHO_REQUEST << 8),
-				htons(ICMPV6_ECHO_REPLY << 8));
+	// Recompute ICMP checksum
+	csum_replace2(&icmp->checksum,
+				htons(ICMP_ECHO << 8),
+				htons(ICMP_ECHOREPLY << 8));
+
 
 	/* Here we sent the packet out of the receive port. Note that
 		* we allocate one entry and schedule it. Your design would be
