@@ -26,7 +26,7 @@ fi
 source "$(dirname "$0")/../testenv/config.sh"
 source $STATEDIR/veth-adv03.state
 
-if ! "$(dirname "$0")/../testenv/testenv.sh" exec -- hping3 --udp -p 5201 --flood -I veth0 $OUTSIDE_IP4; then
+if ! "$(dirname "$0")/../testenv/testenv.sh" exec -- hping3 --icmp --flood -I veth0 $OUTSIDE_IP4; then
     cleanup
 fi
 
